@@ -2,70 +2,29 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Navbar from '../components/Navbar';
 import ProductCard from '../components/ProductCard';
 import OutfitCard from '../components/OutfitCard';
-import { chatAPI } from '../services/api';
+import { chatAPI, speechAPI } from '../services/api';
 import { useAuthStore } from '../store/authStore';
-
-interface Product {
-  id?: string;
-  product_id?: string;
-  name?: string;
-  title?: string;
-  url?: string;
-  productUrl?: string;
-  image_url?: string;
-  imageUrl?: string;
-  price?: string;
-  retailer?: string;
-  brand?: string;
-  onSale?: boolean;
-  originalPrice?: number;
-  discount?: number;
-}
-
-interface OutfitItem {
-  slot: string;
-  category?: string;
-  name: string;
-  price?: string;
-  priceValue?: number;
-  url?: string;
-  productUrl?: string;
-  image_url?: string;
-  imageUrl?: string;
-  retailer?: string;
-  brand?: string;
-  product_id?: string;
-}
-
-interface OutfitReasoning {
-  occasion?: string;
-  weather?: string;
-  color?: string;
-  fit?: string;
-  trend?: string;
-}
-
-interface Outfit {
-  id?: string;
-  outfit_id?: number;
-  name: string;
-  summary?: string;
-  items: OutfitItem[];
-  total_price?: string;
-  totalPrice?: number;
-  score?: number;
-  reasoning?: OutfitReasoning;
-  style?: string;
-  tags?: string[];
-}
+import toast from 'react-hot-toast';
+import {
+  V2Product,
+  V2Outfit,
+  ResponseType,
+  SuggestedAction,
+  adaptProductToV2,
+  adaptOutfitToV2,
+} from '../types/v2';
 
 interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
-  products?: Product[];
-  outfits?: Outfit[];
+  products?: V2Product[];
+  outfits?: V2Outfit[];
+  responseType?: ResponseType;
+  clarificationOptions?: string[];
+  suggestedActions?: SuggestedAction[];
+  imageUrl?: string;
 }
 
 interface ConversationSummary {
@@ -94,8 +53,23 @@ const Chat: React.FC = () => {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(null);
-  const [location, setLocation] = useState('New York');
+  const [location, setLocation] = useState('');
+  const [detectingLocation, setDetectingLocation] = useState(false);
   const [thinkingStage, setThinkingStage] = useState(0);
+
+  // Image upload state
+  const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Voice recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [processingVoice, setProcessingVoice] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Sidebar state
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -103,8 +77,75 @@ const Chat: React.FC = () => {
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [loadingMessages, setLoadingMessages] = useState(false);
 
+  // Clarification state - tracks if we're waiting for user to respond to a clarification question
+  const [isAwaitingClarification, setIsAwaitingClarification] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { user, isAuthenticated } = useAuthStore();
+
+  // Detect user location
+  const detectLocation = useCallback(async () => {
+    setDetectingLocation(true);
+    try {
+      // First try browser geolocation
+      if ('geolocation' in navigator) {
+        const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, {
+            timeout: 5000,
+            enableHighAccuracy: false,
+          });
+        });
+
+        // Reverse geocode using a free API
+        const { latitude, longitude } = position.coords;
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}`
+        );
+        const data = await response.json();
+
+        const city =
+          data.address?.city ||
+          data.address?.town ||
+          data.address?.village ||
+          data.address?.municipality ||
+          data.address?.county;
+
+        if (city) {
+          setLocation(city);
+          toast.success(`Location detected: ${city}`);
+          return;
+        }
+      }
+    } catch (error) {
+      console.log('Geolocation failed, trying IP-based detection');
+    }
+
+    // Fallback to IP-based location
+    try {
+      const response = await fetch('https://ipapi.co/json/');
+      const data = await response.json();
+      if (data.city) {
+        setLocation(data.city);
+        toast.success(`Location detected: ${data.city}`);
+      } else {
+        setLocation('New York'); // Default fallback
+        toast('Using default location: New York', { icon: 'ℹ️' });
+      }
+    } catch (error) {
+      console.error('Failed to detect location:', error);
+      setLocation('New York');
+      toast('Using default location: New York', { icon: 'ℹ️' });
+    } finally {
+      setDetectingLocation(false);
+    }
+  }, []);
+
+  // Auto-detect location on mount
+  useEffect(() => {
+    if (!location) {
+      detectLocation();
+    }
+  }, [location, detectLocation]);
 
   // Load conversations list
   const loadConversations = useCallback(async () => {
@@ -112,9 +153,10 @@ const Chat: React.FC = () => {
 
     setLoadingConversations(true);
     try {
-      const response = await chatAPI.getConversations(1, 50);
-      const convs = response.data.conversations || [];
-      setConversations(convs);
+      const response = await chatAPI.getConversations(user._id, 50);
+      // V2 API returns array directly or in conversations property
+      const convs = response.data.conversations || response.data || [];
+      setConversations(Array.isArray(convs) ? convs : []);
     } catch (err) {
       console.error('Failed to load conversations:', err);
     } finally {
@@ -170,7 +212,8 @@ const Chat: React.FC = () => {
 
     try {
       const response = await chatAPI.createConversation(user._id);
-      const newConvId = response.data.conversation.conversationId;
+      // V2 API returns conversationId directly in response
+      const newConvId = response.data.conversationId || response.data.conversation?.conversationId;
       setConversationId(newConvId);
       setMessages([]);
 
@@ -183,24 +226,40 @@ const Chat: React.FC = () => {
 
   // Load a specific conversation
   const loadConversation = async (convId: string) => {
-    if (convId === conversationId) return; // Already loaded
+    if (convId === conversationId || !user?._id) return; // Already loaded or no user
 
     setLoadingMessages(true);
     try {
-      const response = await chatAPI.getConversation(convId);
+      const response = await chatAPI.getConversation(convId, user._id);
       const conv = response.data;
+
+      console.log('[Chat] Loading conversation:', convId);
+      console.log('[Chat] Loaded messages:', conv.messages?.length);
 
       setConversationId(convId);
 
-      // Map backend messages to frontend format
-      const loadedMessages: Message[] = (conv.messages || []).map((msg: any, idx: number) => ({
-        id: msg._id || msg.id || `msg-${idx}`,
-        role: msg.role === 'user' ? 'user' : 'assistant',
-        content: msg.content || '',
-        timestamp: msg.timestamp || msg.createdAt || new Date().toISOString(),
-        products: msg.data?.products || [],
-        outfits: msg.data?.outfits || [],
-      }));
+      // Map backend messages to frontend format with V2 adaptation
+      const loadedMessages: Message[] = (conv.messages || []).map((msg: any, idx: number) => {
+        const rawProducts = msg.data?.products || [];
+        const rawOutfits = msg.data?.outfits || [];
+
+        // Adapt to V2 format if products/outfits exist
+        const products: V2Product[] = rawProducts.map((p: any) => adaptProductToV2(p));
+        const outfits: V2Outfit[] = rawOutfits.map((o: any, i: number) => adaptOutfitToV2(o, i));
+
+        console.log(`[Chat] Message ${idx}: ${msg.role}, outfits: ${outfits.length}, products: ${products.length}`);
+
+        return {
+          id: msg._id || msg.id || `msg-${idx}`,
+          role: msg.role === 'user' ? 'user' : 'assistant',
+          content: msg.content || '',
+          timestamp: msg.timestamp || msg.createdAt || new Date().toISOString(),
+          products: products.length > 0 ? products : undefined,
+          outfits: outfits.length > 0 ? outfits : undefined,
+          responseType: msg.responseType as ResponseType,
+          suggestedActions: msg.suggestedActions,
+        };
+      });
 
       setMessages(loadedMessages);
     } catch (err) {
@@ -213,10 +272,10 @@ const Chat: React.FC = () => {
   // Delete a conversation
   const deleteConversation = async (convId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!window.confirm('Delete this conversation?')) return;
+    if (!window.confirm('Delete this conversation?') || !user?._id) return;
 
     try {
-      await chatAPI.deleteConversation(convId);
+      await chatAPI.deleteConversation(convId, user._id);
 
       // If we deleted the current conversation, clear it
       if (convId === conversationId) {
@@ -231,54 +290,329 @@ const Chat: React.FC = () => {
     }
   };
 
-  // Send a message
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim()) return;
-
-    // If no conversation, create one first
-    let currentConvId = conversationId;
-    if (!currentConvId && user?._id) {
-      try {
-        const response = await chatAPI.createConversation(user._id);
-        currentConvId = response.data.conversation.conversationId;
-        setConversationId(currentConvId);
-      } catch (err) {
-        console.error('Failed to create conversation:', err);
+  // Handle image selection
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      // Validate file type
+      if (!file.type.startsWith('image/')) {
+        alert('Please select an image file');
         return;
       }
+
+      // Validate file size (max 10MB)
+      if (file.size > 10 * 1024 * 1024) {
+        alert('Image size should be less than 10MB');
+        return;
+      }
+
+      setSelectedImage(file);
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setImagePreview(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  // Remove selected image
+  const removeImage = () => {
+    setSelectedImage(null);
+    setImagePreview(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  // Upload image to server and get URL
+  const uploadImage = async (file: File): Promise<string | null> => {
+    if (!user?._id) return null;
+
+    try {
+      setUploadingImage(true);
+      const response = await chatAPI.uploadImage(file, user._id);
+      return response.data.imageUrl;
+    } catch (error) {
+      console.error('Failed to upload image:', error);
+      // For now, use base64 as fallback (will be processed by backend vision service)
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          resolve(reader.result as string);
+        };
+        reader.readAsDataURL(file);
+      });
+    } finally {
+      setUploadingImage(false);
+    }
+  };
+
+  // Start voice recording
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4',
+      });
+
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        // Stop all tracks
+        stream.getTracks().forEach((track) => track.stop());
+
+        if (audioChunksRef.current.length === 0) {
+          toast.error('No audio recorded');
+          return;
+        }
+
+        const audioBlob = new Blob(audioChunksRef.current, {
+          type: mediaRecorder.mimeType,
+        });
+
+        // Process voice message
+        await processVoiceMessage(audioBlob);
+      };
+
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start(1000); // Collect data every second
+      setIsRecording(true);
+      setRecordingTime(0);
+
+      // Start timer
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingTime((prev) => prev + 1);
+      }, 1000);
+
+      toast.success('Recording started...', { duration: 1500 });
+    } catch (error: any) {
+      console.error('Failed to start recording:', error);
+      if (error.name === 'NotAllowedError') {
+        toast.error('Microphone access denied. Please allow microphone access.');
+      } else {
+        toast.error('Failed to start recording');
+      }
+    }
+  };
+
+  // Stop voice recording
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+    }
+  };
+
+  // Process voice message
+  const processVoiceMessage = async (audioBlob: Blob) => {
+    if (!user?._id) {
+      toast.error('Please log in to send voice messages');
+      return;
     }
 
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      role: 'user',
-      content: input,
-      timestamp: new Date().toISOString(),
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
-    setInput('');
+    setProcessingVoice(true);
     setLoading(true);
 
     try {
-      const response = await chatAPI.sendMessage(input, {
-        location,
-        profile: user?.profile // Include user profile for brand preferences
-      }, currentConvId!);
+      // Create file from blob
+      const audioFile = new File([audioBlob], 'voice-message.webm', {
+        type: audioBlob.type,
+      });
 
-      // Extract products and outfits from response
-      const products = response.data?.response?.data?.products || [];
-      const outfits = response.data?.response?.data?.outfits || [];
+      // Send to speech API for transcription and chat processing
+      const response = await speechAPI.chatWithVoice(
+        audioFile,
+        user._id,
+        conversationId || undefined
+      );
+
+      const data = response.data;
+
+      // Set conversationId if returned
+      if (data.conversationId && !conversationId) {
+        setConversationId(data.conversationId);
+      }
+
+      // Add user message with transcription
+      const userMessage: Message = {
+        id: Date.now().toString(),
+        role: 'user',
+        content: `🎤 ${data.transcription}`,
+        timestamp: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+
+      // Add assistant response
+      const responseData = data.response;
+      const rawProducts = responseData?.data?.products || [];
+      const rawOutfits = responseData?.data?.outfits || [];
+
+      const products: V2Product[] = rawProducts.map((p: any) => adaptProductToV2(p));
+      const outfits: V2Outfit[] = rawOutfits.map((o: any, i: number) => adaptOutfitToV2(o, i));
+
+      const clarificationOptions = data.needsClarification
+        ? responseData?.data?.clarificationOptions
+        : undefined;
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: response.data.response?.message || response.data.error || 'Here are my recommendations!',
+        content: responseData?.message || 'Here are my recommendations!',
         timestamp: new Date().toISOString(),
         products: products.length > 0 ? products : undefined,
         outfits: outfits.length > 0 ? outfits : undefined,
+        responseType: responseData?.type as ResponseType,
+        clarificationOptions,
       };
       setMessages((prev) => [...prev, assistantMessage]);
+
+      // Track if we're awaiting clarification response
+      if (data.needsClarification || (clarificationOptions && clarificationOptions.length > 0)) {
+        setIsAwaitingClarification(true);
+        console.log('[Voice] Awaiting clarification response');
+      } else {
+        setIsAwaitingClarification(false);
+      }
+
+      // Refresh conversations
+      await loadConversations();
+
+      toast.success('Voice message processed!', { duration: 2000 });
+    } catch (error: any) {
+      console.error('Failed to process voice message:', error);
+      toast.error(
+        error.response?.data?.message || 'Failed to process voice message. Please try again.'
+      );
+
+      // Add error message
+      const errorMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: 'Sorry, I couldn\'t process your voice message. Please try again or type your message.',
+        timestamp: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, errorMessage]);
+    } finally {
+      setProcessingVoice(false);
+      setLoading(false);
+      setRecordingTime(0);
+    }
+  };
+
+  // Format recording time
+  const formatRecordingTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Send a message
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() && !selectedImage) return;
+
+    // Upload image first if selected
+    let imageUrl: string | undefined;
+    if (selectedImage) {
+      setUploadingImage(true);
+      const uploadedUrl = await uploadImage(selectedImage);
+      setUploadingImage(false);
+      if (uploadedUrl) {
+        imageUrl = uploadedUrl;
+      }
+    }
+
+    // Need user ID
+    if (!user?._id) {
+      console.error('No user ID available');
+      return;
+    }
+
+    const messageContent = input.trim() || (imageUrl ? 'What can you recommend based on this image?' : '');
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: messageContent,
+      timestamp: new Date().toISOString(),
+      imageUrl: imageUrl,
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    removeImage(); // Clear image after sending
+    setLoading(true);
+
+    try {
+      // V2 API: pass userId and optional conversationId
+      // If no conversationId, the API will create one automatically
+      const response = await chatAPI.sendMessage(messageContent, user._id, conversationId || undefined, imageUrl);
+
+      // V2 API response structure:
+      // { conversationId, messageId, response: { type, message, data: { products, suggestedActions } }, needsClarification, processingTimeMs, nodesExecuted }
+      const fullResponse = response.data;
+
+      // Set conversationId if returned (for new conversations)
+      if (fullResponse.conversationId && !conversationId) {
+        setConversationId(fullResponse.conversationId);
+      }
+
+      // Extract response data - handle both V1 and V2 response formats
+      const responseData = fullResponse?.response || fullResponse;
+
+      // Debug logging for response structure
+      console.log('[Chat] Full response:', fullResponse);
+      console.log('[Chat] Extracted responseData:', responseData);
+      console.log('[Chat] responseData.data:', responseData?.data);
+
+      // V2 products are in response.data.products
+      const rawProducts = responseData?.data?.products || [];
+      const rawOutfits = responseData?.data?.outfits || [];
+      const clarificationOptions = fullResponse?.clarificationData?.options?.map((o: any) => o.label || o) || responseData?.data?.clarificationOptions || [];
+      const suggestedActions = responseData?.data?.suggestedActions || responseData?.suggestedActions || [];
+      const responseType = responseData?.type as ResponseType;
+
+      console.log('[Chat] rawOutfits:', rawOutfits);
+      console.log('[Chat] rawOutfits length:', rawOutfits.length);
+
+      // Adapt products and outfits to V2 format
+      const products: V2Product[] = rawProducts.map((p: any) => adaptProductToV2(p));
+      const outfits: V2Outfit[] = rawOutfits.map((o: any, i: number) => adaptOutfitToV2(o, i));
+
+      console.log('[Chat] Adapted outfits:', outfits);
+      console.log('[Chat] Adapted outfits length:', outfits.length);
+
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: responseData?.message || response.data.error || 'Here are my recommendations!',
+        timestamp: new Date().toISOString(),
+        products: products.length > 0 ? products : undefined,
+        outfits: outfits.length > 0 ? outfits : undefined,
+        responseType,
+        clarificationOptions: clarificationOptions.length > 0 ? clarificationOptions : undefined,
+        suggestedActions: suggestedActions.length > 0 ? suggestedActions : undefined,
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
+
+      // Track if we're awaiting clarification response
+      if (fullResponse?.needsClarification || clarificationOptions.length > 0) {
+        setIsAwaitingClarification(true);
+        console.log('[Chat] Awaiting clarification response');
+      } else {
+        setIsAwaitingClarification(false);
+      }
 
       // Refresh conversations to update the list
       await loadConversations();
@@ -300,17 +634,10 @@ const Chat: React.FC = () => {
   const handleSuggestion = async (msg: string) => {
     setInput(msg);
 
-    // Auto-submit
-    let currentConvId = conversationId;
-    if (!currentConvId && user?._id) {
-      try {
-        const response = await chatAPI.createConversation(user._id);
-        currentConvId = response.data.conversation.conversationId;
-        setConversationId(currentConvId);
-      } catch (err) {
-        console.error('Failed to create conversation:', err);
-        return;
-      }
+    // Need user ID
+    if (!user?._id) {
+      console.error('No user ID available');
+      return;
     }
 
     const userMessage: Message = {
@@ -325,22 +652,57 @@ const Chat: React.FC = () => {
     setLoading(true);
 
     try {
-      const response = await chatAPI.sendMessage(msg, {
-        location,
-        profile: user?.profile // Include user profile for brand preferences
-      }, currentConvId!);
-      const products = response.data?.response?.data?.products || [];
-      const outfits = response.data?.response?.data?.outfits || [];
+      // V2 API: pass userId and optional conversationId
+      const response = await chatAPI.sendMessage(msg, user._id, conversationId || undefined);
+
+      // V2 API response structure
+      const fullResponse = response.data;
+
+      // Set conversationId if returned (for new conversations)
+      if (fullResponse.conversationId && !conversationId) {
+        setConversationId(fullResponse.conversationId);
+      }
+
+      // Extract response data
+      const responseData = fullResponse?.response || fullResponse;
+
+      // Debug logging for response structure
+      console.log('[Chat Suggestion] Full response:', fullResponse);
+      console.log('[Chat Suggestion] rawOutfits:', responseData?.data?.outfits);
+
+      const rawProducts = responseData?.data?.products || [];
+      const rawOutfits = responseData?.data?.outfits || [];
+      const clarificationOptions = fullResponse?.clarificationData?.options?.map((o: any) => o.label || o) || responseData?.data?.clarificationOptions || [];
+      const suggestedActions = responseData?.data?.suggestedActions || responseData?.suggestedActions || [];
+      const responseType = responseData?.type as ResponseType;
+
+      // Adapt products and outfits to V2 format
+      const products: V2Product[] = rawProducts.map((p: any) => adaptProductToV2(p));
+      const outfits: V2Outfit[] = rawOutfits.map((o: any, i: number) => adaptOutfitToV2(o, i));
+
+      console.log('[Chat Suggestion] Adapted outfits:', outfits.length);
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: response.data.response?.message || 'Here are my recommendations!',
+        content: responseData?.message || 'Here are my recommendations!',
         timestamp: new Date().toISOString(),
         products: products.length > 0 ? products : undefined,
         outfits: outfits.length > 0 ? outfits : undefined,
+        responseType,
+        clarificationOptions: clarificationOptions.length > 0 ? clarificationOptions : undefined,
+        suggestedActions: suggestedActions.length > 0 ? suggestedActions : undefined,
       };
       setMessages((prev) => [...prev, assistantMessage]);
+
+      // Track if we're awaiting clarification response
+      if (fullResponse?.needsClarification || clarificationOptions.length > 0) {
+        setIsAwaitingClarification(true);
+        console.log('[Chat Suggestion] Awaiting clarification response');
+      } else {
+        setIsAwaitingClarification(false);
+      }
+
       await loadConversations();
     } catch (err) {
       console.error('Failed to send message:', err);
@@ -353,6 +715,115 @@ const Chat: React.FC = () => {
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Handle clarification response - uses the dedicated /resume endpoint
+  // This provides better context preservation than sending a new message
+  const handleClarificationResponse = async (response: string) => {
+    // Need user ID and conversation ID
+    if (!user?._id) {
+      console.error('No user ID available');
+      return;
+    }
+
+    if (!conversationId) {
+      console.error('No conversation ID available for resume');
+      // Fallback to regular message if no conversation ID
+      handleSuggestion(response);
+      return;
+    }
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: response,
+      timestamp: new Date().toISOString(),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setLoading(true);
+    setIsAwaitingClarification(false); // Clear clarification state
+
+    try {
+      // Use the dedicated resume endpoint for clarification responses
+      console.log('[Chat] Resuming conversation after clarification:', conversationId);
+      const apiResponse = await chatAPI.resumeConversation(conversationId, user._id, response);
+
+      // Process response same as regular messages
+      const fullResponse = apiResponse.data;
+      const responseData = fullResponse?.response || fullResponse;
+
+      console.log('[Chat Resume] Full response:', fullResponse);
+
+      const rawProducts = responseData?.data?.products || [];
+      const rawOutfits = responseData?.data?.outfits || [];
+      const clarificationOptions = fullResponse?.clarificationData?.options?.map((o: any) => o.label || o) || responseData?.data?.clarificationOptions || [];
+      const suggestedActions = responseData?.data?.suggestedActions || responseData?.suggestedActions || [];
+      const responseType = responseData?.type as ResponseType;
+
+      // Adapt products and outfits to V2 format
+      const products: V2Product[] = rawProducts.map((p: any) => adaptProductToV2(p));
+      const outfits: V2Outfit[] = rawOutfits.map((o: any, i: number) => adaptOutfitToV2(o, i));
+
+      console.log('[Chat Resume] Adapted outfits:', outfits.length);
+
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: responseData?.message || 'Here are my recommendations!',
+        timestamp: new Date().toISOString(),
+        products: products.length > 0 ? products : undefined,
+        outfits: outfits.length > 0 ? outfits : undefined,
+        responseType,
+        clarificationOptions: clarificationOptions.length > 0 ? clarificationOptions : undefined,
+        suggestedActions: suggestedActions.length > 0 ? suggestedActions : undefined,
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
+
+      // Check if we need another clarification
+      if (fullResponse?.needsClarification || clarificationOptions.length > 0) {
+        setIsAwaitingClarification(true);
+        console.log('[Chat Resume] Still awaiting clarification');
+      }
+
+      await loadConversations();
+    } catch (err) {
+      console.error('Failed to resume conversation:', err);
+      // On error, try fallback to regular message
+      console.log('[Chat Resume] Falling back to regular message');
+      setIsAwaitingClarification(false);
+
+      const errorMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: 'Sorry, I encountered an error. Please try again.',
+        timestamp: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, errorMessage]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Handle suggested action click
+  const handleSuggestedAction = (action: SuggestedAction) => {
+    // Handle different action types
+    switch (action.action) {
+      case 'save_outfit':
+        // This would be handled by the OutfitCard component
+        console.log('Save outfit action:', action.data);
+        break;
+      case 'modify_budget':
+        handleSuggestion('Show me similar outfits but cheaper');
+        break;
+      case 'replace_item':
+        handleSuggestion('Replace an item in the outfit');
+        break;
+      default:
+        // For custom actions, use the label as the message
+        handleSuggestion(action.label);
     }
   };
 
@@ -489,10 +960,25 @@ const Chat: React.FC = () => {
             </div>
             {/* Location Input */}
             <div className="flex items-center gap-2">
-              <span className="text-xs text-gray-500">Location:</span>
+              <button
+                type="button"
+                onClick={detectLocation}
+                disabled={detectingLocation}
+                className="p-1.5 text-gray-400 hover:text-purple-600 transition-colors disabled:opacity-50"
+                title="Detect my location"
+              >
+                {detectingLocation ? (
+                  <div className="w-4 h-4 border-2 border-gray-300 border-t-purple-500 rounded-full animate-spin"></div>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                )}
+              </button>
               <input
                 type="text"
-                placeholder="City"
+                placeholder={detectingLocation ? 'Detecting...' : 'City'}
                 value={location}
                 onChange={(e) => setLocation(e.target.value)}
                 className="px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent w-32"
@@ -522,6 +1008,16 @@ const Chat: React.FC = () => {
                           : 'bg-white text-gray-800 shadow-sm border border-gray-100 rounded-bl-md'
                       }`}
                     >
+                      {/* Display uploaded image in user message */}
+                      {msg.role === 'user' && msg.imageUrl && (
+                        <div className="mb-2">
+                          <img
+                            src={msg.imageUrl}
+                            alt="Uploaded"
+                            className="max-w-full h-auto rounded-lg max-h-48 object-cover"
+                          />
+                        </div>
+                      )}
                       <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
                       <p className={`text-xs mt-1 ${msg.role === 'user' ? 'text-purple-200' : 'text-gray-400'}`}>
                         {new Date(msg.timestamp).toLocaleTimeString()}
@@ -544,7 +1040,42 @@ const Chat: React.FC = () => {
                       <div className="mt-4 w-full max-w-6xl">
                         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
                           {msg.products.map((product, index) => (
-                            <ProductCard key={product.id || product.product_id || index} product={product} />
+                            <ProductCard key={product.id || index} product={product} />
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Display clarification options - uses dedicated resume endpoint for better context */}
+                    {msg.role === 'assistant' && msg.clarificationOptions && msg.clarificationOptions.length > 0 && (
+                      <div className="mt-4 w-full max-w-xl">
+                        <p className="text-sm text-gray-600 mb-2">Please select an option:</p>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {msg.clarificationOptions.map((option, idx) => (
+                            <button
+                              key={idx}
+                              onClick={() => handleClarificationResponse(option)}
+                              className="px-4 py-2 text-sm text-purple-700 bg-purple-50 hover:bg-purple-100 rounded-lg border border-purple-200 hover:border-purple-300 transition-all text-left"
+                            >
+                              {option}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Display suggested actions */}
+                    {msg.role === 'assistant' && msg.suggestedActions && msg.suggestedActions.length > 0 && (
+                      <div className="mt-3 w-full max-w-xl">
+                        <div className="flex flex-wrap gap-2">
+                          {msg.suggestedActions.map((action, idx) => (
+                            <button
+                              key={idx}
+                              onClick={() => handleSuggestedAction(action)}
+                              className="px-3 py-1.5 text-xs text-purple-600 bg-purple-50 hover:bg-purple-100 rounded-full border border-purple-200 hover:border-purple-300 transition-all"
+                            >
+                              {action.label}
+                            </button>
                           ))}
                         </div>
                       </div>
@@ -560,21 +1091,102 @@ const Chat: React.FC = () => {
 
           {/* Input Area */}
           <div className="bg-white border-t p-4">
+            {/* Image Preview */}
+            {imagePreview && (
+              <div className="mb-3 relative inline-block">
+                <img
+                  src={imagePreview}
+                  alt="Selected"
+                  className="h-24 w-24 object-cover rounded-lg border border-gray-200"
+                />
+                <button
+                  type="button"
+                  onClick={removeImage}
+                  className="absolute -top-2 -right-2 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center hover:bg-red-600 transition-colors"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+                {uploadingImage && (
+                  <div className="absolute inset-0 bg-black/50 rounded-lg flex items-center justify-center">
+                    <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                  </div>
+                )}
+              </div>
+            )}
+
             <form onSubmit={handleSendMessage} className="flex gap-3">
+              {/* Hidden file input */}
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleImageSelect}
+                accept="image/*"
+                className="hidden"
+              />
+
+              {/* Image upload button */}
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={loading || uploadingImage || isRecording}
+                className="p-3 text-gray-500 hover:text-purple-600 hover:bg-purple-50 rounded-xl border border-gray-200 hover:border-purple-300 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                title="Upload an image"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+              </button>
+
+              {/* Voice recording button */}
+              <button
+                type="button"
+                onClick={isRecording ? stopRecording : startRecording}
+                disabled={loading || uploadingImage || processingVoice}
+                className={`p-3 rounded-xl border transition-all ${
+                  isRecording
+                    ? 'bg-red-500 text-white border-red-500 hover:bg-red-600 animate-pulse'
+                    : 'text-gray-500 hover:text-purple-600 hover:bg-purple-50 border-gray-200 hover:border-purple-300'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                title={isRecording ? `Recording... ${formatRecordingTime(recordingTime)} - Click to stop` : 'Start voice recording'}
+              >
+                {processingVoice ? (
+                  <div className="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin"></div>
+                ) : isRecording ? (
+                  <div className="flex items-center gap-2">
+                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                    <span className="text-xs font-medium">{formatRecordingTime(recordingTime)}</span>
+                  </div>
+                ) : (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                  </svg>
+                )}
+              </button>
+
               <input
                 type="text"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Ask for outfit suggestions, product search, or fashion advice..."
+                placeholder={
+                  isRecording
+                    ? '🎤 Recording... Click the red button to stop'
+                    : imagePreview
+                      ? "Describe what you'd like to find or leave empty..."
+                      : 'Type or use voice 🎤 to ask for outfit suggestions...'
+                }
                 className="flex-1 px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-                disabled={loading}
+                disabled={loading || uploadingImage || isRecording}
               />
               <button
                 type="submit"
-                disabled={loading || !input.trim()}
+                disabled={loading || uploadingImage || (!input.trim() && !selectedImage)}
                 className="px-6 py-3 bg-purple-600 text-white rounded-xl hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium transition-colors"
               >
-                {loading ? (
+                {loading || uploadingImage ? (
                   <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
                 ) : (
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -593,10 +1205,10 @@ const Chat: React.FC = () => {
 // Welcome Message Component
 function WelcomeMessage({ onSuggestion }: { onSuggestion: (msg: string) => void }) {
   const suggestions = [
-    { text: 'Show me red dresses under $150', emoji: '👗' },
+    { text: 'What should I wear for hiking?', emoji: '🥾' },
     { text: 'Create a professional outfit for a job interview', emoji: '💼' },
-    { text: 'Find summer casual looks', emoji: '☀️' },
-    { text: "What's trending this season?", emoji: '🔥' },
+    { text: 'Show me red dresses under $150', emoji: '👗' },
+    { text: 'Beach vacation outfit ideas', emoji: '🏖️' },
   ];
 
   return (
