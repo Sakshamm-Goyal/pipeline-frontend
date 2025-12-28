@@ -206,8 +206,8 @@ const Onboarding: React.FC = () => {
         },
       });
 
-      // Step 9: Consent
-      await onboardingAPI.saveStep9({
+      // Step 10: Data Retention / Consent (GDPR)
+      await onboardingAPI.saveStep10({
         consentGiven: true,
         allowDataSharing: false,
         allowAITraining: false,
